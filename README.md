@@ -1,2 +1,2 @@
 # klod
-A simple bubblewrapper to host an AI harness
+A simple bubblewrapper to host an AI harness.
