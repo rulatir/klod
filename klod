@@ -105,5 +105,17 @@ if [[ -f "$SECRETS_FILES" ]]; then
   done < "$SECRETS_FILES"
 fi
 
+# Claude Code's background service (claude daemon) listens in
+# /tmp/cc-daemon-<uid>. Each sandbox mounts its own empty directory there, so a
+# Claude inside reaches only a service started inside the same sandbox, which
+# runs with the same masks. A service started outside stays out of reach.
+DAEMON_DIR="/tmp/cc-daemon-$(id -u)"
+mkdir -p -m 700 "$DAEMON_DIR"
+BWRAP_ARGS+=(--perms 0700 --tmpfs "$DAEMON_DIR")
+
+# Tells processes inside which project's masks apply. The Claude Code
+# SessionStart check reads it.
+BWRAP_ARGS+=(--setenv KLOD_PROJECT_DIR "$PROJECT_DIR")
+
 cd "$PROJECT_DIR"
 exec bwrap "${BWRAP_ARGS[@]}" -- bash

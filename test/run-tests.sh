@@ -274,6 +274,32 @@ run_out=$(HOME="$D/fakehome" run_klod "$D" "cat -- '$D/fakehome/.netrc' apps/cms
 unset KLOD_T_DIR
 echo
 
+# Group 10: each sandbox has its own Claude Code daemon directory, and
+# exports the project it masks.
+echo "[daemon] private /tmp/cc-daemon-<uid>, KLOD_PROJECT_DIR"
+D=$(new_fixture)
+: > "$D/.agentsdeny"
+DAEMON_DIR="/tmp/cc-daemon-$(id -u)"
+mkdir -p -m 700 "$DAEMON_DIR"
+OUTSIDE_SOCK="$DAEMON_DIR/klod-test-outside-$$"
+INSIDE_SOCK="$DAEMON_DIR/klod-test-inside-$$"
+: > "$OUTSIDE_SOCK"
+out=$(run_klod "$D" "ls -A '$DAEMON_DIR'; stat -c 'mode=%a' '$DAEMON_DIR'; : > '$INSIDE_SOCK'; echo \"project=\$KLOD_PROJECT_DIR\"")
+rm -f "$OUTSIDE_SOCK"
+[[ "$out" != *"klod-test-outside-$$"* ]] && ok "daemon directory from outside is hidden" \
+  || nope "daemon directory from outside is hidden" "$out"
+[[ "$out" == *"mode=700"* ]] && ok "daemon directory inside has mode 700" \
+  || nope "daemon directory inside has mode 700" "$out"
+if [[ -e "$INSIDE_SOCK" ]]; then
+  rm -f "$INSIDE_SOCK"
+  nope "daemon directory from inside stays inside" "$INSIDE_SOCK appeared on the host"
+else
+  ok "daemon directory from inside stays inside"
+fi
+[[ "$out" == *"project=$(realpath "$D")"* ]] && ok "KLOD_PROJECT_DIR names the project" \
+  || nope "KLOD_PROJECT_DIR names the project" "$out"
+echo
+
 # --- summary ---------------------------------------------------------------
 
 echo "============================================"
