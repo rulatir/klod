@@ -1,0 +1,109 @@
+#!/bin/bash
+set -e
+
+PROJECT_DIR=$(realpath "${1:-$PWD}")
+SECRETS_FILES="$PROJECT_DIR/.agentsdeny"
+DENY_DIR="$PROJECT_DIR/.bwrap-deny"
+
+if [[ "$1" == "--init" ]]; then
+  touch "$SECRETS_FILES"
+  # Create a directory that is not traversable/readable by anyone
+  mkdir -p "$DENY_DIR"
+  chmod 000 "$DENY_DIR"
+  echo "Created $SECRETS_FILES and $DENY_DIR (mode 000)"
+  exit 0
+fi
+
+BWRAP_ARGS=(--dev-bind / /)
+
+# expand_entry <entry>
+# Writes <entry> to EXPANDED with a leading "~" or "~/" replaced by $HOME and
+# each $NAME or ${NAME} replaced by the environment variable NAME. A "$" not
+# followed by a name stays literal. The function does not call eval, so "$(...)"
+# and backticks stay literal text. Returns 1 and writes the name to UNSET_NAME
+# when a referenced variable is unset.
+expand_entry() {
+  local rest="$1" re='^\{([A-Za-z_][A-Za-z0-9_]*)\}(.*)$|^([A-Za-z_][A-Za-z0-9_]*)(.*)$'
+  local name
+  EXPANDED=""
+  if [[ "$rest" == "~" || "$rest" == "~/"* ]]; then
+    rest="$HOME${rest:1}"
+  fi
+  while [[ "$rest" == *'$'* ]]; do
+    EXPANDED+="${rest%%\$*}"
+    rest="${rest#*\$}"
+    if [[ "$rest" =~ $re ]]; then
+      name="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
+      rest="${BASH_REMATCH[2]}${BASH_REMATCH[4]}"
+      if ! printenv "$name" >/dev/null; then
+        UNSET_NAME="$name"
+        return 1
+      fi
+      EXPANDED+="$(printenv "$name")"
+    else
+      EXPANDED+='$'
+    fi
+  done
+  EXPANDED+="$rest"
+}
+
+if [[ -f "$SECRETS_FILES" ]]; then
+  while IFS= read -r entry; do
+    entry="${entry%"${entry##*[![:space:]]}"}"
+    [[ -z "$entry" || "$entry" =~ ^# ]] && continue
+
+    # An unset variable would expand to "" and turn "$FOO/secret" into
+    # "/secret", so the entry is skipped.
+    if ! expand_entry "$entry"; then
+      echo "Warning: .agentsdeny entry uses unset variable $UNSET_NAME, left unmasked: $entry" >&2
+      continue
+    fi
+    entry="$EXPANDED"
+
+    if [[ "$entry" = /* ]]; then
+      target="$entry"
+    else
+      target="$PROJECT_DIR/$entry"
+    fi
+
+    # bwrap binds onto an existing path only, so a target that does not exist
+    # yet gets no mask and is readable the moment something creates it inside
+    # the sandbox. Create it first. A trailing slash asks for a directory,
+    # anything else for a file.
+    #
+    # Only paths the project owns are created. Everything else is the system's
+    # to make: /run/docker.sock appears when docker runs, and a regular file
+    # left in its place would be worse than no mask. The check is against the
+    # resolved path, so a relative entry cannot escape the project with "..".
+    if [[ ! -e "$target" ]]; then
+      canon=$(realpath -m "$target")
+      if [[ "$canon" == "$PROJECT_DIR"/* ]]; then
+        if [[ "$entry" == */ ]]; then
+          mkdir -p "$target"
+        else
+          mkdir -p "$(dirname "$target")"
+          touch "$target"
+        fi
+        echo "klod: created missing deny target: $entry" >&2
+      else
+        echo "Warning: .agentsdeny entry does not exist and is outside $PROJECT_DIR, left unmasked: $entry" >&2
+        continue
+      fi
+    fi
+
+    # If it's a directory, bind a non-accessible directory on top.
+    if [[ -d "$target" ]]; then
+      # Ensure deny dir exists (in case --init wasn't run)
+      mkdir -p "$DENY_DIR"
+      chmod 000 "$DENY_DIR"
+      BWRAP_ARGS+=(--bind "$DENY_DIR" "$target")
+
+    # Anything else (file, socket) gets /dev/null bound on top.
+    else
+      BWRAP_ARGS+=(--bind /dev/null "$target")
+    fi
+  done < "$SECRETS_FILES"
+fi
+
+cd "$PROJECT_DIR"
+exec bwrap "${BWRAP_ARGS[@]}" -- bash
