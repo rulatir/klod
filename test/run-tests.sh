@@ -8,9 +8,13 @@
 # The invariant we assert is content-based, not error-string based:
 #   - A DENIED file's secret content must never be visible inside the sandbox.
 #   - A file that is NOT listed must remain readable.
-# (klod surfaces a denial as EACCES "Permission denied" because it binds
-# /dev/null / a mode-000 dir over the target, but we don't rely on the exact
-# error text — locale-dependent — only on the secret never leaking.)
+# (klod surfaces a denial as EACCES "Permission denied" from its AppArmor
+# profile, but we don't rely on the exact error text — locale-dependent —
+# only on the secret never leaking.)
+#
+# Needs AppArmor active in the kernel. klod loads a profile with sudo on each
+# run, so the first run asks for the password and sudo's cached credentials
+# cover the rest.
 
 set -u
 
@@ -24,6 +28,12 @@ if ! command -v bwrap >/dev/null 2>&1; then
   echo "FATAL: bwrap (bubblewrap) is not installed — klod cannot run." >&2
   exit 2
 fi
+if [[ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" != Y ]]; then
+  echo "FATAL: AppArmor is not active in the kernel — klod cannot run." >&2
+  exit 2
+fi
+# Ask for the sudo password once, up front, instead of inside the first test.
+sudo -v || { echo "FATAL: sudo is needed to load klod's AppArmor profiles." >&2; exit 2; }
 
 PASS=0
 FAIL=0
@@ -157,6 +167,13 @@ printf 'apps/cms\n' > "$D/.agentsdeny"
 assert_blocked  "apps/cms/.env blocked via dir entry"   "$D" "apps/cms/.env"      "SECRET_CMS"
 assert_blocked  "apps/cms/config.txt blocked via dir"   "$D" "apps/cms/config.txt" "PUBLIC_CMS"
 assert_readable "apps/web/.env outside dir is readable"  "$D" "apps/web/.env"      "SECRET_WEB"
+# The directory itself is denied too: its entries' names do not show.
+out=$(run_klod "$D" "ls -A apps/cms 2>/dev/null; echo listed")
+if [[ "$out" == *"config.txt"* ]]; then
+  nope "listing a denied directory shows nothing" "names visible: $out"
+else
+  ok "listing a denied directory shows nothing"
+fi
 echo
 
 # Group 6: comments, blank lines and trailing whitespace are ignored/handled.
@@ -182,38 +199,30 @@ for method in "cat .env" "head -n1 .env" "grep . .env" "read x < .env; echo \$x"
 done
 echo
 
-# Group 8: entries that do not exist yet are created, then masked.
-# bwrap binds onto an existing path only, so a target that is absent when the
-# sandbox starts gets no mask at all — and whatever creates it later, inside
-# the sandbox, gets a fully readable file. klod must create it first.
-echo "[missing] deny entries that do not exist yet are created and masked"
+# Group 8: entries that do not exist yet are denied by path. klod creates
+# nothing on the host, and nothing written to such a path inside the sandbox
+# reads back.
+echo "[missing] deny entries that do not exist yet"
 D=$(new_fixture)
 printf '.env-secrets\nlater/dir/\n' > "$D/.agentsdeny"
 
 run_klod "$D" "true" >/dev/null
-if [[ -f "$D/.env-secrets" ]]; then
-  ok "missing file entry is created on the host"
+if [[ ! -e "$D/.env-secrets" && ! -e "$D/later" ]]; then
+  ok "missing entries are not created on the host"
 else
-  nope "missing file entry is created on the host" "$D/.env-secrets was not created"
-fi
-if [[ -d "$D/later/dir" ]]; then
-  ok "missing entry with a trailing slash becomes a directory"
-else
-  nope "missing entry with a trailing slash becomes a directory" "$D/later/dir is not a directory"
+  nope "missing entries are not created on the host" "klod created $(ls -d "$D/.env-secrets" "$D/later" 2>/dev/null)"
 fi
 
-# The regression itself: a secret written to the once-missing path inside the
-# sandbox must not read back, because the path is bound to /dev/null.
 out=$(run_klod "$D" "echo SECRET_LATER > .env-secrets; cat -- .env-secrets")
 if [[ "$out" == *"SECRET_LATER"* ]]; then
-  nope "once-missing .env-secrets is masked" "secret read back from a path that did not exist at mask time: $out"
+  nope "a missing file entry stays denied when written inside" "secret read back: $out"
 else
-  ok "once-missing .env-secrets is masked"
+  ok "a missing file entry stays denied when written inside"
 fi
 if grep -q 'SECRET_LATER' "$D/.env-secrets" 2>/dev/null; then
-  nope "write to a once-missing entry does not reach the host" "host .env-secrets holds: $(cat "$D/.env-secrets")"
+  nope "write to a missing entry does not reach the host" "host .env-secrets holds: $(cat "$D/.env-secrets")"
 else
-  ok "write to a once-missing entry does not reach the host"
+  ok "write to a missing entry does not reach the host"
 fi
 
 # Missing targets outside the project are never created: they belong to the
@@ -236,12 +245,12 @@ else
   ok "relative entry cannot escape the project with .."
 fi
 
-# A directory created from a trailing-slash entry blocks what is put in it.
-out=$(run_klod "$D" "echo SECRET_INDIR > later/dir/f 2>/dev/null; cat -- later/dir/f 2>/dev/null; echo done")
+# A directory entry that does not exist yet denies what is put under it.
+out=$(run_klod "$D" "mkdir -p later/dir 2>/dev/null; echo SECRET_INDIR > later/dir/f 2>/dev/null; cat -- later/dir/f 2>/dev/null; echo done")
 if [[ "$out" == *"SECRET_INDIR"* ]]; then
-  nope "once-missing directory entry is masked" "secret readable under later/dir: $out"
+  nope "a missing directory entry stays denied when filled inside" "secret readable under later/dir: $out"
 else
-  ok "once-missing directory entry is masked"
+  ok "a missing directory entry stays denied when filled inside"
 fi
 echo
 
@@ -275,7 +284,7 @@ unset KLOD_T_DIR
 echo
 
 # Group 10: each sandbox has its own Claude Code daemon directory, and
-# exports the project it masks.
+# exports the project whose deny list applies.
 echo "[daemon] private /tmp/cc-daemon-<uid>, KLOD_PROJECT_DIR"
 D=$(new_fixture)
 : > "$D/.agentsdeny"
@@ -298,6 +307,50 @@ else
 fi
 [[ "$out" == *"project=$(realpath "$D")"* ]] && ok "KLOD_PROJECT_DIR names the project" \
   || nope "KLOD_PROJECT_DIR names the project" "$out"
+echo
+
+# Group 11: an entry replaced from outside while the sandbox runs stays
+# denied. The build replaces generated files (write elsewhere, rename over),
+# which gives the path a new inode; a deny bound to the old file would lapse.
+echo "[replaced] an entry replaced from outside stays denied"
+D=$(new_fixture)
+printf '.env\n' > "$D/.agentsdeny"
+STARTED="$D/started-$$"
+(
+  for _ in $(seq 1 200); do [[ -e "$STARTED" ]] && break; sleep 0.1; done
+  printf 'SECRET_REPLACED\n' > "$D/.env.next"
+  mv "$D/.env.next" "$D/.env"
+  touch "$D/replaced-$$"
+) &
+replacer=$!
+out=$(run_klod "$D" "touch '$STARTED'; for _ in \$(seq 1 200); do [ -e '$D/replaced-$$' ] && break; sleep 0.1; done; cat -- .env; echo read-done")
+wait "$replacer"
+if [[ ! -e "$D/replaced-$$" ]]; then
+  nope ".env replaced mid-session stays denied" "the replacement did not happen while the sandbox ran: $out"
+elif [[ "$out" == *"SECRET_REPLACED"* ]]; then
+  nope ".env replaced mid-session stays denied" "secret leaked after replacement: $out"
+elif [[ "$out" != *"read-done"* ]]; then
+  nope ".env replaced mid-session stays denied" "the sandbox did not finish: $out"
+else
+  ok ".env replaced mid-session stays denied"
+fi
+echo
+
+# Group 12: the generated profile compiles, for entry names with characters
+# AppArmor reads as glob or variable syntax. Needs neither root nor an active
+# AppArmor.
+echo "[profile] generated profile compiles"
+D=$(new_fixture)
+printf '%s\n' 'with space.env' 'star*.env' 'price$' 'brace{a,b}.env' 'dir/' > "$D/.agentsdeny"
+if out=$("$KLOD" --print-profile "$D" 2>&1 | apparmor_parser -Q -K -T --features-file /etc/apparmor.d/abi/4.0 -S 2>&1 >/dev/null); then
+  ok "profile with special characters compiles"
+else
+  nope "profile with special characters compiles" "$out"
+fi
+prof=$("$KLOD" --print-profile "$D" 2>/dev/null)
+[[ "$prof" == *'star\*.env{,/,/**}" rwlkmx,'* && "$prof" == *'/dir{,/,/**}" rwlkmx,'* ]] \
+  && ok "path characters are escaped, the directory glob is not" \
+  || nope "path characters are escaped, the directory glob is not" "$prof"
 echo
 
 # --- summary ---------------------------------------------------------------
